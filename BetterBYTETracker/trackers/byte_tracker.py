@@ -14,6 +14,9 @@ class BYTETracker:
     """Fully vectorized BYTETracker using Struct-of-Arrays layout.
 
     All track state is stored in contiguous numpy arrays. No per-track Python objects.
+
+    Input: (N, 6) array of [x, y, w, h, conf, cls] per detection.
+    Output: (M, 8) array of [x1, y1, x2, y2, track_id, score, cls, idx].
     """
 
     def __init__(self, args, frame_rate: int = 30):
@@ -47,48 +50,62 @@ class BYTETracker:
 
     @staticmethod
     def _xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
-        cx, cy, w, h = xywh[:, 0], xywh[:, 1], xywh[:, 2], xywh[:, 3]
-        return np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
+        cx, cy, w, h = xywh[..., 0], xywh[..., 1], xywh[..., 2], xywh[..., 3]
+        return np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1)
 
-    def _apply_match(self, m_idx_cp, det_xyah, det_scores, det_cls, det_idx_vals, m_local, m_det):
+    def _apply_match(self, m_idx, det_xyah, det_scores, det_cls, det_idx_vals, m_local, m_det):
         """Apply Kalman update and state changes for a set of matches."""
-        old_lens = self.tracklet_lens[m_idx_cp].copy()
-        was_tracked = self.states[m_idx_cp] == TRACKED
+        old_lens = self.tracklet_lens[m_idx].copy()
+        was_tracked = self.states[m_idx] == TRACKED
 
         # Batch Kalman update
         new_means, new_covs = self.kalman_filter.batch_update(
-            self.means[m_idx_cp], self.covariances[m_idx_cp], det_xyah[m_det]
+            self.means[m_idx], self.covariances[m_idx], det_xyah[m_det]
         )
-        self.means[m_idx_cp] = new_means
-        self.covariances[m_idx_cp] = new_covs
+        self.means[m_idx] = new_means
+        self.covariances[m_idx] = new_covs
 
-        self.scores[m_idx_cp] = det_scores[m_det]
-        self.cls[m_idx_cp] = det_cls[m_det]
-        self.idx[m_idx_cp] = det_idx_vals[m_det]
-        self.frame_ids[m_idx_cp] = self.frame_id
-        self.states[m_idx_cp] = TRACKED
-        self.is_activated[m_idx_cp] = True
+        self.scores[m_idx] = det_scores[m_det]
+        self.cls[m_idx] = det_cls[m_det]
+        self.idx[m_idx] = det_idx_vals[m_det]
+        self.frame_ids[m_idx] = self.frame_id
+        self.states[m_idx] = TRACKED
+        self.is_activated[m_idx] = True
         # tracked: old_len + 1, lost (re-activate): 0
-        self.tracklet_lens[m_idx_cp] = np.where(was_tracked, old_lens + 1, np.int32(0))
+        self.tracklet_lens[m_idx] = np.where(was_tracked, old_lens + 1, np.int32(0))
 
-    def update(self, results, img=None, feats=None) -> np.ndarray:
+    def update(self, detections: np.ndarray) -> np.ndarray:
+        """Process one frame of detections.
+
+        Args:
+            detections: (N, 6) array of [x, y, w, h, conf, cls].
+                        Also accepts (6,) for a single detection.
+
+        Returns:
+            (M, 8) array of [x1, y1, x2, y2, track_id, score, cls, idx].
+        """
+        detections = np.asarray(detections, dtype=np.float32)
+        if detections.ndim == 1:
+            detections = detections[np.newaxis]
         self.frame_id += 1
 
         # ---- 1. Split detections by confidence ----
-        scores = results.conf
+        xywh = detections[..., :4]
+        scores = detections[..., 4]
+        cls_vals = detections[..., 5]
+
         high_mask = scores >= self.args.track_high_thresh
         low_mask = (scores > self.args.track_low_thresh) & ~high_mask
 
-        det_high = results[high_mask]
-        det_low = results[low_mask]
-        n_high = len(det_high)
-        n_low = len(det_low)
+        n_high = int(high_mask.sum())
+        n_low = int(low_mask.sum())
 
         if n_high > 0:
-            high_xyah = self._det_to_xyah(det_high.xywh)
-            high_xyxy = self._xywh_to_xyxy(det_high.xywh)
-            high_scores = det_high.conf
-            high_cls = det_high.cls
+            high_xywh = xywh[high_mask]
+            high_xyah = self._det_to_xyah(high_xywh)
+            high_xyxy = self._xywh_to_xyxy(high_xywh)
+            high_scores = scores[high_mask]
+            high_cls = cls_vals[high_mask]
             high_idx_vals = np.where(high_mask)[0].astype(np.float32)
         else:
             high_xyah = np.empty((0, 4), dtype=np.float32)
@@ -98,10 +115,11 @@ class BYTETracker:
             high_idx_vals = np.empty(0, dtype=np.float32)
 
         if n_low > 0:
-            low_xyah = self._det_to_xyah(det_low.xywh)
-            low_xyxy = self._xywh_to_xyxy(det_low.xywh)
-            low_scores = det_low.conf
-            low_cls = det_low.cls
+            low_xywh = xywh[low_mask]
+            low_xyah = self._det_to_xyah(low_xywh)
+            low_xyxy = self._xywh_to_xyxy(low_xywh)
+            low_scores = scores[low_mask]
+            low_cls = cls_vals[low_mask]
             low_idx_vals = np.where(low_mask)[0].astype(np.float32)
         else:
             low_xyah = np.empty((0, 4), dtype=np.float32)
@@ -148,8 +166,8 @@ class BYTETracker:
 
             if len(matches) > 0:
                 matches = np.asarray(matches)
-                m_idx_cp = pool_idx[matches[:, 0]]
-                self._apply_match(m_idx_cp, high_xyah, high_scores, high_cls, high_idx_vals, matches[:, 0], matches[:, 1])
+                m_idx = pool_idx[matches[:, 0]]
+                self._apply_match(m_idx, high_xyah, high_scores, high_cls, high_idx_vals, matches[:, 0], matches[:, 1])
 
         # ---- 5. Second association: remaining tracked vs low-confidence dets ----
         if len(u_pool) > 0:
@@ -168,8 +186,8 @@ class BYTETracker:
 
             if len(matches) > 0:
                 matches = np.asarray(matches)
-                m_idx_cp = r_tracked_idx[matches[:, 0]]
-                self._apply_match(m_idx_cp, low_xyah, low_scores, low_cls, low_idx_vals, matches[:, 0], matches[:, 1])
+                m_idx = r_tracked_idx[matches[:, 0]]
+                self._apply_match(m_idx, low_xyah, low_scores, low_cls, low_idx_vals, matches[:, 0], matches[:, 1])
 
         # Mark unmatched remaining tracked as lost
         if len(u_r_tracked) > 0:
@@ -194,20 +212,20 @@ class BYTETracker:
             if len(matches) > 0:
                 matches = np.asarray(matches)
                 m_det_global = np.asarray(remaining_high_det)[matches[:, 1]]
-                m_idx_cp = unconf_idx[matches[:, 0]]
+                m_idx = unconf_idx[matches[:, 0]]
 
                 new_means, new_covs = self.kalman_filter.batch_update(
-                    self.means[m_idx_cp], self.covariances[m_idx_cp], high_xyah[m_det_global]
+                    self.means[m_idx], self.covariances[m_idx], high_xyah[m_det_global]
                 )
-                self.means[m_idx_cp] = new_means
-                self.covariances[m_idx_cp] = new_covs
-                self.scores[m_idx_cp] = high_scores[m_det_global]
-                self.cls[m_idx_cp] = high_cls[m_det_global]
-                self.idx[m_idx_cp] = high_idx_vals[m_det_global]
-                self.states[m_idx_cp] = TRACKED
-                self.is_activated[m_idx_cp] = True
-                self.frame_ids[m_idx_cp] = self.frame_id
-                self.tracklet_lens[m_idx_cp] += 1
+                self.means[m_idx] = new_means
+                self.covariances[m_idx] = new_covs
+                self.scores[m_idx] = high_scores[m_det_global]
+                self.cls[m_idx] = high_cls[m_det_global]
+                self.idx[m_idx] = high_idx_vals[m_det_global]
+                self.states[m_idx] = TRACKED
+                self.is_activated[m_idx] = True
+                self.frame_ids[m_idx] = self.frame_id
+                self.tracklet_lens[m_idx] += 1
 
             # Mark unmatched unconfirmed as removed
             if len(u_unconfirmed) > 0:
