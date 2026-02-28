@@ -2,7 +2,7 @@
 
 Drop-in replacement for [ultralytics BYTETracker](https://github.com/ultralytics/ultralytics) that's ~2x faster. Same algorithm, same output, no extra dependencies.
 
-The speedup comes from replacing per-track Python objects (`STrack`) with numpy. Allows batched inputs.
+The speedup comes from replacing per-track Python objects (`STrack`) with pure numpy allowing better vectorization.
 
 ## Benchmarks
 
@@ -24,8 +24,10 @@ python -m BetterBYTETracker.benchmarks.bench_bytetracker --sprints 128 --warmup 
 - **Regular bounding boxes only** — no OBB (oriented bounding box) support
 - **Batch numpy input** — expects numpy arrays, not Ultralytics Results object
 - **API change** 
+
     ultralytics def update(self, results, img: np.ndarray | None = None, feats: np.ndarray | None = None) -> np.ndarray:
-    Ours:       def update(self, detections: np.ndarray) -> np.ndarray:
+
+    Ours:       def update(self, detections: np.ndarray) -> np.ndarray
 - **No ReID / appearance features** — purely IoU-based matching (same as upstream BYTETracker default)
 
 ## Tests
