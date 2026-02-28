@@ -16,9 +16,9 @@ import pytest
 # ---------------------------------------------------------------------------
 
 class FakeResults:
-    """Minimal results object mimicking ultralytics Results for BYTETracker.update()."""
+    """Minimal results object for BYTETracker.update(). Numpy-backed."""
 
-    def __init__(self, xywh: np.ndarray, conf: np.ndarray, cls: np.ndarray):
+    def __init__(self, xywh, conf, cls):
         self.xywh = np.asarray(xywh, dtype=np.float32)
         self.conf = np.asarray(conf, dtype=np.float32)
         self.cls = np.asarray(cls, dtype=np.float32)
@@ -34,7 +34,7 @@ class FakeResults:
 # Deterministic detection sequence (5 frames, 3 objects with slight motion)
 # ---------------------------------------------------------------------------
 
-def _make_detections(seed: int = 42) -> list[FakeResults]:
+def _make_detections(seed: int = 42):
     """Generate a short deterministic detection sequence."""
     rng = np.random.RandomState(seed)
     n_frames, n_objects = 5, 3
@@ -80,7 +80,7 @@ TRACKER_ARGS = SimpleNamespace(
 # ---------------------------------------------------------------------------
 
 def _run_ours(frames: list[FakeResults]) -> list[np.ndarray]:
-    """Run our stripped-down BYTETracker."""
+    """Run our BYTETracker (numpy in, numpy out)."""
     import importlib
 
     mod = importlib.import_module("cuda-bytetracker.trackers.byte_tracker")
@@ -149,9 +149,8 @@ class TestParity:
             np.empty(0, dtype=np.float32),
             np.empty(0, dtype=np.float32),
         )
-        frames = [empty] * 3
-        ours = _run_ours(frames)
-        ultra = _run_ultra(frames)
+        ours = _run_ours([empty] * 3)
+        ultra = _run_ultra([empty] * 3)
         for i, (o, u) in enumerate(zip(ours, ultra)):
             assert o.shape == u.shape, f"Frame {i}: shape mismatch on empty input"
 
@@ -162,10 +161,8 @@ class TestParity:
             np.array([0.95], dtype=np.float32),
             np.array([0], dtype=np.float32),
         )
-        # Feed same detection for several frames so it activates
-        frames = [det] * 5
-        ours = _run_ours(frames)
-        ultra = _run_ultra(frames)
+        ours = _run_ours([det] * 5)
+        ultra = _run_ultra([det] * 5)
         for i, (o, u) in enumerate(zip(ours, ultra)):
             o_sorted = _sort_by_track_id(o)
             u_sorted = _sort_by_track_id(u)
@@ -179,7 +176,6 @@ class TestParity:
 
     def test_disappearing_object(self):
         """An object that disappears mid-sequence should be handled identically."""
-        rng = np.random.RandomState(99)
         frames = []
         for f in range(8):
             if f < 4:

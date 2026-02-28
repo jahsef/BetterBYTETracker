@@ -2,7 +2,7 @@
 
 Usage:
     python -m cuda-bytetracker.benchmarks.bench_bytetracker
-    python -m cuda-bytetracker.benchmarks.bench_bytetracker --sprints 10 --warmup 5 --frames 50
+    python -m cuda-bytetracker.benchmarks.bench_bytetracker --sprints 128 --warmup 16 --frames 128
 """
 
 from __future__ import annotations
@@ -20,7 +20,9 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 class FakeResults:
-    def __init__(self, xywh: np.ndarray, conf: np.ndarray, cls: np.ndarray):
+    """Numpy-backed results for both trackers."""
+
+    def __init__(self, xywh, conf, cls):
         self.xywh = np.asarray(xywh, dtype=np.float32)
         self.conf = np.asarray(conf, dtype=np.float32)
         self.cls = np.asarray(cls, dtype=np.float32)
@@ -36,8 +38,11 @@ class FakeResults:
 # Detection generators
 # ---------------------------------------------------------------------------
 
-def _make_sequence(n_frames: int, n_objects: int, seed: int = 0) -> list[FakeResults]:
-    """Objects where half move left-to-right and half move right-to-left."""
+def _make_sequence(n_frames: int, n_objects: int, seed: int = 0):
+    """Objects where half move left-to-right and half move right-to-left.
+
+    Returns list of FakeResults frames.
+    """
     rng = np.random.RandomState(seed)
     n_ltr = n_objects // 2
     n_rtl = n_objects - n_ltr
@@ -84,7 +89,7 @@ TRACKER_ARGS = SimpleNamespace(
 # Runner
 # ---------------------------------------------------------------------------
 
-def _time_tracker(make_tracker, frames: list[FakeResults], n_sprints: int, n_warmup: int) -> np.ndarray:
+def _time_tracker(make_tracker, frames, n_sprints: int, n_warmup: int) -> np.ndarray:
     """Return per-frame timings in seconds, shape (n_sprints * n_frames,).
 
     Runs n_warmup untimed sprints first to warm up caches and JIT paths.
