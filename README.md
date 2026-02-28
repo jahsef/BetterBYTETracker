@@ -19,6 +19,12 @@ The speedup comes from replacing per-track Python objects (`STrack`) with pure n
 python -m BetterBYTETracker.benchmarks.bench_bytetracker --sprints 128 --warmup 16 --frames 128
 ```
 
+## Installation
+- Clone repo
+- cd repo
+- pip install .
+- profit
+
 ## Limitations
 
 - **Regular bounding boxes only** — no OBB (oriented bounding box) support

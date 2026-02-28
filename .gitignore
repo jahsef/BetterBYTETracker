@@ -1,3 +1,4 @@
 .claude/
 *.pyc
 *__pycache__/
+/BetterBYTETracker.egg-info
