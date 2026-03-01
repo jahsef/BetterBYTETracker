@@ -2,7 +2,7 @@
 
 Usage:
     python -m BetterBYTETracker.benchmarks.bench_bytetracker
-    python -m BetterBYTETracker.benchmarks.bench_bytetracker --sprints 128 --warmup 16 --frames 128
+    python -m BetterBYTETracker.benchmarks.bench_bytetracker --sprints 128 --warmup 16 --frames 128 --multiplier 10
 """
 
 from __future__ import annotations
@@ -32,33 +32,126 @@ class _UltraResults:
         return _UltraResults(self.xywh[idx], self.conf[idx], self.cls[idx])
 
 
-def _make_sequence(n_frames: int, n_objects: int, seed: int = 0):
-    """Objects where half move left-to-right and half move right-to-left."""
-    rng = np.random.RandomState(seed)
-    n_ltr = n_objects // 2
-    n_rtl = n_objects - n_ltr
+def _make_sequence(n_frames: int, multiplier: int, seed: int = 0):
+    """Generate detection sequence with 4 detection types per multiplier.
 
-    ltr_x = np.linspace(50, 150, n_ltr, dtype=np.float32)
-    rtl_x = np.linspace(600, 500, n_rtl, dtype=np.float32)
-    start_x = np.concatenate([ltr_x, rtl_x])
-    start_y = np.linspace(100, 300, n_objects, dtype=np.float32)
-    vx = np.concatenate([np.full(n_ltr, 8.0), np.full(n_rtl, -8.0)]).astype(np.float32)
-    w = rng.uniform(30, 60, n_objects).astype(np.float32)
-    h = rng.uniform(50, 90, n_objects).astype(np.float32)
+    Detection types (each spawned `multiplier` times):
+      - linear: left-to-right / right-to-left with occasional lost frames
+      - erroneous: random short-lived detections popping in/out
+      - circular: moves in a circle with occasional lost frames
+      - random_walk: random movement, mean-reverting to stay centered
+
+    Args:
+        n_frames: number of frames to generate.
+        multiplier: number of detections per type (total ~ 4 * multiplier per frame).
+        seed: random seed.
+
+    Returns:
+        (our_frames, ultra_frames) lists of per-frame data.
+    """
+    rng = np.random.RandomState(seed)
+
+    # --- Linear detections: half LTR, half RTL, 5% drop chance ---
+    n_lin = multiplier
+    n_ltr = n_lin // 2
+    n_rtl = n_lin - n_ltr
+    lin_start_x = np.concatenate([
+        np.linspace(50, 150, n_ltr),
+        np.linspace(600, 500, n_rtl),
+    ]).astype(np.float32)
+    lin_start_y = np.linspace(100, 300, n_lin).astype(np.float32)
+    lin_vx = np.concatenate([np.full(n_ltr, 8.0), np.full(n_rtl, -8.0)]).astype(np.float32)
+    lin_w = rng.uniform(30, 60, n_lin).astype(np.float32)
+    lin_h = rng.uniform(50, 90, n_lin).astype(np.float32)
+    lin_drop = 0.05
+
+    # --- Circular detections: 5% drop chance ---
+    n_circ = multiplier
+    circ_cx = rng.uniform(200, 500, n_circ).astype(np.float32)
+    circ_cy = rng.uniform(150, 350, n_circ).astype(np.float32)
+    circ_r = rng.uniform(30, 80, n_circ).astype(np.float32)
+    circ_phase = rng.uniform(0, 2 * np.pi, n_circ).astype(np.float32)
+    circ_speed = rng.uniform(0.05, 0.15, n_circ).astype(np.float32)
+    circ_w = rng.uniform(25, 50, n_circ).astype(np.float32)
+    circ_h = rng.uniform(40, 80, n_circ).astype(np.float32)
+    circ_drop = 0.05
+
+    # --- Random walk detections: mean-reverting, 5% drop chance ---
+    n_rw = multiplier
+    rw_x = rng.uniform(150, 500, n_rw).astype(np.float32)
+    rw_y = rng.uniform(100, 400, n_rw).astype(np.float32)
+    rw_home_x = rw_x.copy()
+    rw_home_y = rw_y.copy()
+    rw_w = rng.uniform(30, 55, n_rw).astype(np.float32)
+    rw_h = rng.uniform(50, 85, n_rw).astype(np.float32)
+    rw_drop = 0.05
+    rw_revert = 0.05  # mean reversion strength
+
+    # --- Erroneous detections: random, 40% drop chance (short-lived) ---
+    n_err = multiplier
 
     our_frames = []
     ultra_frames = []
+
     for f in range(n_frames):
-        noise = rng.randn(n_objects, 2).astype(np.float32) * 1.5
-        xywh = np.column_stack([
-            start_x + f * vx + noise[:, 0],
-            start_y + f * 2 + noise[:, 1],
-            w, h,
-        ])
-        conf = np.clip(0.85 + rng.randn(n_objects).astype(np.float32) * 0.04, 0.5, 1.0)
-        cls = np.zeros(n_objects, dtype=np.float32)
-        our_frames.append(np.column_stack([xywh, conf, cls]))
-        ultra_frames.append(_UltraResults(xywh, conf, cls))
+        parts = []
+
+        # Linear
+        noise = rng.randn(n_lin, 2).astype(np.float32) * 1.5
+        lin_alive = rng.random(n_lin) >= lin_drop
+        if lin_alive.any():
+            lin_xywh = np.column_stack([
+                lin_start_x + f * lin_vx + noise[:, 0],
+                lin_start_y + f * 2 + noise[:, 1],
+                lin_w, lin_h,
+            ])[lin_alive]
+            lin_conf = np.clip(0.85 + rng.randn(int(lin_alive.sum())).astype(np.float32) * 0.04, 0.5, 1.0)
+            parts.append(np.column_stack([lin_xywh, lin_conf, np.zeros(len(lin_conf), dtype=np.float32)]))
+
+        # Circular
+        circ_alive = rng.random(n_circ) >= circ_drop
+        if circ_alive.any():
+            angle = circ_phase + f * circ_speed
+            cx = circ_cx + circ_r * np.cos(angle)
+            cy = circ_cy + circ_r * np.sin(angle)
+            noise_c = rng.randn(n_circ, 2).astype(np.float32) * 1.0
+            circ_xywh = np.column_stack([
+                cx + noise_c[:, 0], cy + noise_c[:, 1],
+                circ_w, circ_h,
+            ])[circ_alive]
+            circ_conf = np.clip(0.82 + rng.randn(int(circ_alive.sum())).astype(np.float32) * 0.05, 0.5, 1.0)
+            parts.append(np.column_stack([circ_xywh, circ_conf, np.ones(len(circ_conf), dtype=np.float32)]))
+
+        # Random walk (mean-reverting)
+        rw_alive = rng.random(n_rw) >= rw_drop
+        rw_x += rng.randn(n_rw).astype(np.float32) * 5.0 + rw_revert * (rw_home_x - rw_x)
+        rw_y += rng.randn(n_rw).astype(np.float32) * 5.0 + rw_revert * (rw_home_y - rw_y)
+        if rw_alive.any():
+            rw_xywh = np.column_stack([rw_x, rw_y, rw_w, rw_h])[rw_alive]
+            rw_conf = np.clip(0.80 + rng.randn(int(rw_alive.sum())).astype(np.float32) * 0.06, 0.5, 1.0)
+            parts.append(np.column_stack([rw_xywh, rw_conf, np.full(len(rw_conf), 2.0, dtype=np.float32)]))
+
+        # Erroneous (random short-lived)
+        err_alive = rng.random(n_err) >= 0.40
+        if err_alive.any():
+            n_alive_err = int(err_alive.sum())
+            err_xywh = np.column_stack([
+                rng.uniform(0, 640, n_alive_err).astype(np.float32),
+                rng.uniform(0, 480, n_alive_err).astype(np.float32),
+                rng.uniform(20, 60, n_alive_err).astype(np.float32),
+                rng.uniform(30, 80, n_alive_err).astype(np.float32),
+            ])
+            err_conf = np.clip(0.55 + rng.randn(n_alive_err).astype(np.float32) * 0.15, 0.2, 1.0)
+            parts.append(np.column_stack([err_xywh, err_conf, np.full(n_alive_err, 3.0, dtype=np.float32)]))
+
+        if parts:
+            frame = np.concatenate(parts, axis=0).astype(np.float32)
+        else:
+            frame = np.empty((0, 6), dtype=np.float32)
+
+        our_frames.append(frame)
+        ultra_frames.append(_UltraResults(frame[:, :4], frame[:, 4], frame[:, 5]))
+
     return our_frames, ultra_frames
 
 
@@ -115,19 +208,17 @@ def main():
     parser.add_argument("--sprints", type=int, default=5, help="Number of timed sprints (default: 5)")
     parser.add_argument("--warmup", type=int, default=3, help="Number of warmup sprints before timing (default: 3)")
     parser.add_argument("--frames", type=int, default=30, help="Frames per sprint (default: 30)")
-    parser.add_argument("--objects", type=int, default=10, help="Objects per frame (default: 10)")
+    parser.add_argument("--multiplier", type=int, default=10, help="Detections per type (total ~ 4x this, default: 10)")
     args = parser.parse_args()
 
     n_sprints = args.sprints
     n_warmup = args.warmup
     n_frames = args.frames
-    n_objects = args.objects
+    multiplier = args.multiplier
 
-    our_frames, ultra_frames = _make_sequence(n_frames, n_objects)
+    our_frames, ultra_frames = _make_sequence(n_frames, multiplier)
 
-    n_ltr = n_objects // 2
-    assert our_frames[-1][0, 0] > our_frames[0][0, 0], "LTR objects: x should increase"
-    assert our_frames[-1][n_ltr, 0] < our_frames[0][n_ltr, 0], "RTL objects: x should decrease"
+    avg_dets = np.mean([len(f) for f in our_frames])
 
     def make_ours():
         return OursBYTETracker(TRACKER_ARGS, frame_rate=30)
@@ -138,7 +229,7 @@ def main():
     n_samples = n_sprints * n_frames
 
     print(f"Config: {n_warmup} warmup + {n_sprints} sprints x {n_frames} frames/sprint, "
-          f"{n_objects} objects/frame, {n_samples} samples\n")
+          f"~{avg_dets:.0f} detections/frame (multiplier={multiplier}), {n_samples} samples\n")
 
     rows = []
 

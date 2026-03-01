@@ -19,25 +19,27 @@ class BYTETracker:
     Output: (M, 8) array of [x1, y1, x2, y2, track_id, score, cls, idx].
     """
     
-    def __init__(self, args, frame_rate: int = 30):
+    def __init__(self, args, frame_rate: int = 30, max_tracks: int = 512):
         self.frame_id = 0
         self.args = args
         self.max_time_lost = int(frame_rate / 30.0 * args.track_buffer)
         self.kalman_filter = KalmanFilterXYAH()
         self._next_id = 0
+        self.max_tracks = max_tracks
+        self._high = 0  # high-water mark: all live tracks are in [:_high]
 
-        # SoA track state — all empty at start
-        self.means = np.empty((0, 8), dtype=np.float32)
-        self.covariances = np.empty((0, 8, 8), dtype=np.float32)
-        self.scores = np.empty(0, dtype=np.float32)
-        self.cls = np.empty(0, dtype=np.float32)
-        self.track_ids = np.empty(0, dtype=np.int32)
-        self.states = np.empty(0, dtype=np.int8)
-        self.is_activated = np.empty(0, dtype=np.bool_)
-        self.frame_ids = np.empty(0, dtype=np.int32)
-        self.start_frames = np.empty(0, dtype=np.int32)
-        self.tracklet_lens = np.empty(0, dtype=np.int32)
-        self.idx = np.empty(0, dtype=np.float32)
+        # Pre-allocated SoA track state — REMOVED slots are free
+        self.means = np.zeros((max_tracks, 8), dtype=np.float32)
+        self.covariances = np.zeros((max_tracks, 8, 8), dtype=np.float32)
+        self.scores = np.zeros(max_tracks, dtype=np.float32)
+        self.cls = np.zeros(max_tracks, dtype=np.float32)
+        self.track_ids = np.zeros(max_tracks, dtype=np.int32)
+        self.states = np.full(max_tracks, REMOVED, dtype=np.int8)
+        self.is_activated = np.zeros(max_tracks, dtype=np.bool_)
+        self.frame_ids = np.zeros(max_tracks, dtype=np.int32)
+        self.start_frames = np.zeros(max_tracks, dtype=np.int32)
+        self.tracklet_lens = np.zeros(max_tracks, dtype=np.int32)
+        self.idx = np.zeros(max_tracks, dtype=np.float32)
 
     def _alloc_ids(self, n: int) -> np.ndarray:
         ids = np.arange(self._next_id + 1, self._next_id + 1 + n, dtype=np.int32)
@@ -54,7 +56,7 @@ class BYTETracker:
         Tracks in LOST state have their height velocity zeroed before prediction.
         Only tracks with state TRACKED or LOST are predicted.
         """
-        predict_mask = (self.states == TRACKED) | (self.states == LOST)
+        predict_mask = (self.states[:self._high] == TRACKED) | (self.states[:self._high] == LOST)
         predict_idx = np.where(predict_mask)[0]
         if len(predict_idx) == 0:
             return
@@ -80,15 +82,16 @@ class BYTETracker:
             (M, 8) array of [x1, y1, x2, y2, track_id, score, cls, idx].
             Empty (0, 8) array if no active tracks.
         """
-        out_mask = (self.states == TRACKED) & self.is_activated
+        h = self._high
+        out_mask = (self.states[:h] == TRACKED) & self.is_activated[:h]
         if out_mask.any():
-            out_xyxy = batch_means_to_xyxy(self.means[out_mask])
+            out_xyxy = batch_means_to_xyxy(self.means[:h][out_mask])
             return np.concatenate([
                 out_xyxy,
-                self.track_ids[out_mask].astype(np.float32).reshape(-1, 1),
-                self.scores[out_mask].reshape(-1, 1),
-                self.cls[out_mask].reshape(-1, 1),
-                self.idx[out_mask].reshape(-1, 1),
+                self.track_ids[:h][out_mask].astype(np.float32).reshape(-1, 1),
+                self.scores[:h][out_mask].reshape(-1, 1),
+                self.cls[:h][out_mask].reshape(-1, 1),
+                self.idx[:h][out_mask].reshape(-1, 1),
             ], axis=1)
         return np.empty((0, 8), dtype=np.float32)
 
@@ -102,11 +105,12 @@ class BYTETracker:
         base = self.get_active_tracks()
         if len(base) == 0:
             return np.empty((0, 10), dtype=np.float32)
-        out_mask = (self.states == TRACKED) & self.is_activated
+        h = self._high
+        out_mask = (self.states[:h] == TRACKED) & self.is_activated[:h]
         return np.concatenate([
             base,
-            self.start_frames[out_mask].astype(np.float32).reshape(-1, 1),
-            self.frame_ids[out_mask].astype(np.float32).reshape(-1, 1),
+            self.start_frames[:h][out_mask].astype(np.float32).reshape(-1, 1),
+            self.frame_ids[:h][out_mask].astype(np.float32).reshape(-1, 1),
         ], axis=1)
 
     @staticmethod
@@ -190,9 +194,11 @@ class BYTETracker:
             low_idx_vals = np.empty(0, dtype=np.float32)
 
         # ---- 2. Build track masks ----
-        tracked_activated_mask = (self.states == TRACKED) & self.is_activated
-        unconfirmed_mask = (self.states == TRACKED) & ~self.is_activated
-        lost_mask = self.states == LOST
+        h = self._high
+        states_h = self.states[:h]
+        tracked_activated_mask = (states_h == TRACKED) & self.is_activated[:h]
+        unconfirmed_mask = (states_h == TRACKED) & ~self.is_activated[:h]
+        lost_mask = states_h == LOST
         pool_mask = tracked_activated_mask | lost_mask
 
         pool_idx = np.where(pool_mask)[0]
@@ -291,53 +297,51 @@ class BYTETracker:
             new_det = remaining_high_det[new_mask]
 
             if len(new_det) > 0:
-                new_xyah = high_xyah[new_det]
-                new_means, new_covs = self.kalman_filter.batch_initiate(new_xyah)
-                n_new = len(new_det)
-                new_ids = self._alloc_ids(n_new)
+                free_slots = np.where(self.states[:self._high] == REMOVED)[0]
+                if len(free_slots) < len(new_det):
+                    # Extend into unused buffer space
+                    extra = min(len(new_det) - len(free_slots), self.max_tracks - self._high)
+                    if extra > 0:
+                        extra_slots = np.arange(self._high, self._high + extra)
+                        free_slots = np.concatenate([free_slots, extra_slots])
+                n_new = min(len(new_det), len(free_slots))
+                if n_new > 0:
+                    new_det = new_det[:n_new]
+                    slots = free_slots[:n_new]
+                    new_xyah = high_xyah[new_det]
+                    new_means, new_covs = self.kalman_filter.batch_initiate(new_xyah)
+                    new_ids = self._alloc_ids(n_new)
 
-                self.means = np.concatenate([self.means, new_means])
-                self.covariances = np.concatenate([self.covariances, new_covs])
-                self.scores = np.concatenate([self.scores, high_scores[new_det]])
-                self.cls = np.concatenate([self.cls, high_cls[new_det]])
-                self.track_ids = np.concatenate([self.track_ids, new_ids])
-                self.states = np.concatenate([self.states, np.full(n_new, TRACKED, dtype=np.int8)])
-                self.is_activated = np.concatenate([self.is_activated, np.full(n_new, self.frame_id == 1, dtype=np.bool_)])
-                self.frame_ids = np.concatenate([self.frame_ids, np.full(n_new, self.frame_id, dtype=np.int32)])
-                self.start_frames = np.concatenate([self.start_frames, np.full(n_new, self.frame_id, dtype=np.int32)])
-                self.tracklet_lens = np.concatenate([self.tracklet_lens, np.zeros(n_new, dtype=np.int32)])
-                self.idx = np.concatenate([self.idx, high_idx_vals[new_det]])
+                    self.means[slots] = new_means
+                    self.covariances[slots] = new_covs
+                    self.scores[slots] = high_scores[new_det]
+                    self.cls[slots] = high_cls[new_det]
+                    self.track_ids[slots] = new_ids
+                    self.states[slots] = TRACKED
+                    self.is_activated[slots] = self.frame_id == 1
+                    self.frame_ids[slots] = self.frame_id
+                    self.start_frames[slots] = self.frame_id
+                    self.tracklet_lens[slots] = 0
+                    self.idx[slots] = high_idx_vals[new_det]
+                    self._high = max(self._high, int(slots[-1]) + 1)
 
         # ---- 8. Expire lost tracks ----
-        lost_expire = (self.states == LOST) & ((self.frame_id - self.frame_ids) > self.max_time_lost)
-        self.states[lost_expire] = REMOVED
+        h = self._high
+        lost_expire = (self.states[:h] == LOST) & ((self.frame_id - self.frame_ids[:h]) > self.max_time_lost)
+        if lost_expire.any():
+            expire_idx = np.where(lost_expire)[0]
+            self.states[expire_idx] = REMOVED
 
         # ---- 9. Remove duplicates ----
         self._remove_duplicates()
 
-        # ---- 10. Prune removed ----
-        keep = self.states != REMOVED
-        self._apply_mask(keep)
-        
-        # ---- 11. Output ----
+        # ---- 10. Output ----
         return self.get_active_tracks()
 
-    def _apply_mask(self, mask: np.ndarray):
-        self.means = self.means[mask]
-        self.covariances = self.covariances[mask]
-        self.scores = self.scores[mask]
-        self.cls = self.cls[mask]
-        self.track_ids = self.track_ids[mask]
-        self.states = self.states[mask]
-        self.is_activated = self.is_activated[mask]
-        self.frame_ids = self.frame_ids[mask]
-        self.start_frames = self.start_frames[mask]
-        self.tracklet_lens = self.tracklet_lens[mask]
-        self.idx = self.idx[mask]
-
     def _remove_duplicates(self):
-        tracked_mask = (self.states == TRACKED) & self.is_activated
-        lost_mask = self.states == LOST
+        h = self._high
+        tracked_mask = (self.states[:h] == TRACKED) & self.is_activated[:h]
+        lost_mask = self.states[:h] == LOST
         tracked_idx = np.where(tracked_mask)[0]
         lost_idx = np.where(lost_mask)[0]
 
@@ -365,8 +369,10 @@ class BYTETracker:
             self.states[np.asarray(to_remove, dtype=np.int64)] = REMOVED
 
     def reset(self):
-        fr = int(30.0 * self.max_time_lost / self.args.track_buffer) if self.args.track_buffer > 0 else 30
-        self.__init__(self.args, frame_rate=fr)
+        self.frame_id = 0
+        self._next_id = 0
+        self.states[:self._high] = REMOVED
+        self._high = 0
 
     @staticmethod
     def reset_id():
