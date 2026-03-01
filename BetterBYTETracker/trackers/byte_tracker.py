@@ -18,7 +18,7 @@ class BYTETracker:
     Input: (N, 6) array of [x, y, w, h, conf, cls] per detection.
     Output: (M, 8) array of [x1, y1, x2, y2, track_id, score, cls, idx].
     """
-
+    
     def __init__(self, args, frame_rate: int = 30):
         self.frame_id = 0
         self.args = args
@@ -47,6 +47,67 @@ class BYTETracker:
     @staticmethod
     def _det_to_xyah(xywh: np.ndarray) -> np.ndarray:
         return batch_tlwh_to_xyah(xywh2ltwh(xywh))
+
+    def predict(self):
+        """Run Kalman prediction on all active tracks, updating means (N, 8) and covariances (N, 8, 8) in-place.
+
+        Tracks in LOST state have their height velocity zeroed before prediction.
+        Only tracks with state TRACKED or LOST are predicted.
+        """
+        predict_mask = (self.states == TRACKED) | (self.states == LOST)
+        predict_idx = np.where(predict_mask)[0]
+        if len(predict_idx) == 0:
+            return
+
+        pred_means = self.means[predict_idx].copy()
+        pred_covs = self.covariances[predict_idx]
+
+        not_tracked = self.states[predict_idx] != TRACKED
+        pred_means[not_tracked, 7] = 0
+
+        pred_means, pred_covs = self.kalman_filter.batch_predict(pred_means, pred_covs)
+        self.means[predict_idx] = pred_means
+        self.covariances[predict_idx] = pred_covs
+
+    def multi_predict(self, tracks):
+        """Alias for predict(), kept for API parity with ultralytics BYTETracker. tracks arg does not do anything"""
+        self.predict()
+
+    def get_active_tracks(self) -> np.ndarray:
+        """Return currently active (tracked and activated) tracks.
+
+        Returns:
+            (M, 8) array of [x1, y1, x2, y2, track_id, score, cls, idx].
+            Empty (0, 8) array if no active tracks.
+        """
+        out_mask = (self.states == TRACKED) & self.is_activated
+        if out_mask.any():
+            out_xyxy = batch_means_to_xyxy(self.means[out_mask])
+            return np.concatenate([
+                out_xyxy,
+                self.track_ids[out_mask].astype(np.float32).reshape(-1, 1),
+                self.scores[out_mask].reshape(-1, 1),
+                self.cls[out_mask].reshape(-1, 1),
+                self.idx[out_mask].reshape(-1, 1),
+            ], axis=1)
+        return np.empty((0, 8), dtype=np.float32)
+
+    def get_active_tracks_with_lifetime(self) -> np.ndarray:
+        """Return active tracks with frame lifetime info.
+
+        Returns:
+            (M, 10) array of [x1, y1, x2, y2, track_id, score, cls, idx, start_frame, last_frame].
+            Empty (0, 10) array if no active tracks.
+        """
+        base = self.get_active_tracks()
+        if len(base) == 0:
+            return np.empty((0, 10), dtype=np.float32)
+        out_mask = (self.states == TRACKED) & self.is_activated
+        return np.concatenate([
+            base,
+            self.start_frames[out_mask].astype(np.float32).reshape(-1, 1),
+            self.frame_ids[out_mask].astype(np.float32).reshape(-1, 1),
+        ], axis=1)
 
     @staticmethod
     def _xywh_to_xyxy(xywh: np.ndarray) -> np.ndarray:
@@ -138,19 +199,7 @@ class BYTETracker:
         unconf_idx = np.where(unconfirmed_mask)[0]
 
         # ---- 3. Kalman predict pool + unconfirmed ----
-        predict_mask = pool_mask | unconfirmed_mask
-        predict_idx = np.where(predict_mask)[0]
-        if len(predict_idx) > 0:
-            pred_means = self.means[predict_idx].copy()
-            pred_covs = self.covariances[predict_idx]
-
-            # Zero vh for non-tracked (lost) tracks
-            not_tracked = self.states[predict_idx] != TRACKED
-            pred_means[not_tracked, 7] = 0
-
-            pred_means, pred_covs = self.kalman_filter.batch_predict(pred_means, pred_covs)
-            self.means[predict_idx] = pred_means
-            self.covariances[predict_idx] = pred_covs
+        self.predict()
 
         # ---- 4. First association: pool tracks vs high-confidence dets ----
         u_detection_high = np.arange(n_high)
@@ -269,21 +318,9 @@ class BYTETracker:
         # ---- 10. Prune removed ----
         keep = self.states != REMOVED
         self._apply_mask(keep)
-
+        
         # ---- 11. Output ----
-        out_mask = (self.states == TRACKED) & self.is_activated
-        n_out = int(out_mask.sum())
-        if n_out > 0:
-            out_means = self.means[out_mask]
-            out_xyxy = batch_means_to_xyxy(out_means)
-            return np.concatenate([
-                out_xyxy,
-                self.track_ids[out_mask].astype(np.float32).reshape(-1, 1),
-                self.scores[out_mask].reshape(-1, 1),
-                self.cls[out_mask].reshape(-1, 1),
-                self.idx[out_mask].reshape(-1, 1),
-            ], axis=1)
-        return np.empty((0, 8), dtype=np.float32)
+        return self.get_active_tracks()
 
     def _apply_mask(self, mask: np.ndarray):
         self.means = self.means[mask]
